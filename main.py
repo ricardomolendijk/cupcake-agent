@@ -268,6 +268,22 @@ class UpdateAgent:
             logger.error(f"Failed to check node role: {e}")
             return False
     
+    def _host_command(self, cmd):
+        """Wrap command to execute on host using nsenter"""
+        # Use nsenter to run command in host namespaces
+        # PID 1 is always the init process on the host
+        return [
+            'nsenter', '--target', '1',
+            '--mount', '--uts', '--ipc', '--net', '--pid',
+            '--'
+        ] + cmd
+    
+    def _check_host_command(self, cmd):
+        """Check if command exists on host"""
+        check_cmd = self._host_command(['which', cmd])
+        result = subprocess.run(check_cmd, capture_output=True, text=True)
+        return result.returncode == 0
+    
     def step_download_packages(self, operation_dir, logs_dir, metadata):
         """Download/prepare upgrade packages"""
         target_version = metadata.get('target_version')
@@ -276,13 +292,13 @@ class UpdateAgent:
         log_file = logs_dir / 'download-packages.log'
         
         try:
-            # Detect package manager
-            if shutil.which('apt-get'):
+            # Detect package manager on host
+            if self._check_host_command('apt-get'):
                 self._download_packages_apt(target_version, log_file)
-            elif shutil.which('yum'):
+            elif self._check_host_command('yum'):
                 self._download_packages_yum(target_version, log_file)
             else:
-                raise Exception("No supported package manager found (apt-get or yum)")
+                raise Exception("No supported package manager found on host (apt-get or yum)")
                 
         except Exception as e:
             logger.error(f"Failed to download packages: {e}")
@@ -292,8 +308,8 @@ class UpdateAgent:
         """Download packages using apt (Debian/Ubuntu)"""
         logger.info("Using apt package manager")
         
-        # Update package cache
-        cmd = ['apt-get', 'update']
+        # Update package cache on host
+        cmd = self._host_command(['apt-get', 'update'])
         with open(log_file, 'w') as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
         
@@ -305,7 +321,7 @@ class UpdateAgent:
             f"kubectl{version_suffix}"
         ]
         
-        cmd = ['apt-get', 'download'] + packages
+        cmd = self._host_command(['apt-get', 'download'] + packages)
         with open(log_file, 'a') as f:
             result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
             
@@ -322,7 +338,7 @@ class UpdateAgent:
             f"kubectl{version_suffix}"
         ]
         
-        cmd = ['yum', 'install', '--downloadonly', '-y'] + packages
+        cmd = self._host_command(['yum', 'install', '--downloadonly', '-y'] + packages)
         with open(log_file, 'w') as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
@@ -336,19 +352,19 @@ class UpdateAgent:
         log_file = logs_dir / 'upgrade-kubeadm.log'
         
         try:
-            if shutil.which('apt-get'):
-                cmd = ['apt-get', 'install', '-y', '--allow-change-held-packages',
-                       f"kubeadm={target_version}-00"]
-            elif shutil.which('yum'):
-                cmd = ['yum', 'install', '-y', f"kubeadm-{target_version}-0"]
+            if self._check_host_command('apt-get'):
+                cmd = self._host_command(['apt-get', 'install', '-y', '--allow-change-held-packages',
+                       f"kubeadm={target_version}-00"])
+            elif self._check_host_command('yum'):
+                cmd = self._host_command(['yum', 'install', '-y', f"kubeadm-{target_version}-0"])
             else:
                 raise Exception("No supported package manager found")
             
             with open(log_file, 'w') as f:
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
-            # Verify kubeadm version
-            result = subprocess.run(['kubeadm', 'version', '-o', 'short'],
+            # Verify kubeadm version on host
+            result = subprocess.run(self._host_command(['kubeadm', 'version', '-o', 'short']),
                                   capture_output=True, text=True, check=True)
             logger.info(f"Kubeadm upgraded: {result.stdout.strip()}")
             
@@ -365,13 +381,13 @@ class UpdateAgent:
         
         try:
             # First, check current plan
-            cmd = ['kubeadm', 'upgrade', 'plan', f"v{target_version}"]
+            cmd = self._host_command(['kubeadm', 'upgrade', 'plan', f"v{target_version}"])
             with open(log_file, 'w') as f:
                 f.write(f"=== Upgrade Plan ===\n")
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
             
             # Apply the upgrade
-            cmd = ['kubeadm', 'upgrade', 'apply', f"v{target_version}", '-y', '--force']
+            cmd = self._host_command(['kubeadm', 'upgrade', 'apply', f"v{target_version}", '-y', '--force'])
             with open(log_file, 'a') as f:
                 f.write(f"\n=== Applying Upgrade ===\n")
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
@@ -389,7 +405,7 @@ class UpdateAgent:
         log_file = logs_dir / 'kubeadm-upgrade-node.log'
         
         try:
-            cmd = ['kubeadm', 'upgrade', 'node']
+            cmd = self._host_command(['kubeadm', 'upgrade', 'node'])
             with open(log_file, 'w') as f:
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
@@ -407,22 +423,22 @@ class UpdateAgent:
         log_file = logs_dir / 'upgrade-kubelet.log'
         
         try:
-            if shutil.which('apt-get'):
-                cmd = ['apt-get', 'install', '-y', '--allow-change-held-packages',
+            if self._check_host_command('apt-get'):
+                cmd = self._host_command(['apt-get', 'install', '-y', '--allow-change-held-packages',
                        f"kubelet={target_version}-00",
-                       f"kubectl={target_version}-00"]
-            elif shutil.which('yum'):
-                cmd = ['yum', 'install', '-y',
+                       f"kubectl={target_version}-00"])
+            elif self._check_host_command('yum'):
+                cmd = self._host_command(['yum', 'install', '-y',
                        f"kubelet-{target_version}-0",
-                       f"kubectl-{target_version}-0"]
+                       f"kubectl-{target_version}-0"])
             else:
                 raise Exception("No supported package manager found")
             
             with open(log_file, 'w') as f:
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
-            # Verify versions
-            result = subprocess.run(['kubelet', '--version'],
+            # Verify versions on host
+            result = subprocess.run(self._host_command(['kubelet', '--version']),
                                   capture_output=True, text=True, check=True)
             logger.info(f"Kubelet upgraded: {result.stdout.strip()}")
             
@@ -438,19 +454,19 @@ class UpdateAgent:
         
         try:
             with open(log_file, 'w') as f:
-                # Reload systemd
-                subprocess.run(['systemctl', 'daemon-reload'], 
+                # Reload systemd on host
+                subprocess.run(self._host_command(['systemctl', 'daemon-reload']), 
                              stdout=f, stderr=subprocess.STDOUT, check=True)
                 
-                # Restart kubelet
-                subprocess.run(['systemctl', 'restart', 'kubelet'], 
+                # Restart kubelet on host
+                subprocess.run(self._host_command(['systemctl', 'restart', 'kubelet']), 
                              stdout=f, stderr=subprocess.STDOUT, check=True)
             
             # Wait for kubelet to stabilize
             time.sleep(15)
             
-            # Check kubelet status
-            result = subprocess.run(['systemctl', 'is-active', 'kubelet'],
+            # Check kubelet status on host
+            result = subprocess.run(self._host_command(['systemctl', 'is-active', 'kubelet']),
                                   capture_output=True, text=True)
             
             if result.stdout.strip() == 'active':
@@ -469,12 +485,12 @@ class UpdateAgent:
         log_file = logs_dir / 'upgrade-containerd.log'
         
         try:
-            if shutil.which('apt-get'):
+            if self._check_host_command('apt-get'):
                 # Debian/Ubuntu
-                cmd = ['apt-get', 'install', '-y', '--allow-change-held-packages', 'containerd.io']
-            elif shutil.which('yum'):
+                cmd = self._host_command(['apt-get', 'install', '-y', '--allow-change-held-packages', 'containerd.io'])
+            elif self._check_host_command('yum'):
                 # RHEL/CentOS
-                cmd = ['yum', 'update', '-y', 'containerd.io']
+                cmd = self._host_command(['yum', 'update', '-y', 'containerd.io'])
             else:
                 logger.warning("Unknown package manager, skipping containerd upgrade")
                 return
@@ -482,12 +498,12 @@ class UpdateAgent:
             with open(log_file, 'w') as f:
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
-            # Restart containerd
-            subprocess.run(['systemctl', 'restart', 'containerd'], check=True)
+            # Restart containerd on host
+            subprocess.run(self._host_command(['systemctl', 'restart', 'containerd']), check=True)
             time.sleep(5)
             
-            # Verify containerd is running
-            result = subprocess.run(['systemctl', 'is-active', 'containerd'],
+            # Verify containerd is running on host
+            result = subprocess.run(self._host_command(['systemctl', 'is-active', 'containerd']),
                                   capture_output=True, text=True, check=True)
             
             logger.info(f"Containerd upgraded and restarted: {result.stdout.strip()}")
