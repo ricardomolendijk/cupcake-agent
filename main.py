@@ -284,6 +284,118 @@ class UpdateAgent:
         result = subprocess.run(check_cmd, capture_output=True, text=True)
         return result.returncode == 0
     
+    def _get_exact_package_version_apt(self, target_version, log_file):
+        """Get the exact package version string from apt repository"""
+        logger.info(f"Resolving exact package version for {target_version}")
+        
+        # Query apt-cache for available versions
+        cmd = self._host_command(['apt-cache', 'madison', 'kubeadm'])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        with open(log_file, 'a') as f:
+            f.write(f"\n=== Available kubeadm versions ===\n")
+            f.write(result.stdout)
+        
+        if result.returncode != 0:
+            raise Exception("Failed to query available package versions")
+        
+        # Parse the output to find matching versions
+        # Format: kubeadm | 1.31.0-1.1 | https://pkgs.k8s.io/core:/stable:/v1.31/deb  Packages
+        matching_versions = []
+        for line in result.stdout.split('\n'):
+            if '|' in line and target_version in line:
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 2:
+                    version = parts[1]
+                    matching_versions.append(version)
+        
+        if not matching_versions:
+            # Try common version suffixes
+            common_suffixes = ['-00', '-1.1', '-0', '-1']
+            for suffix in common_suffixes:
+                test_version = f"{target_version}{suffix}"
+                for line in result.stdout.split('\n'):
+                    if test_version in line:
+                        parts = [p.strip() for p in line.split('|')]
+                        if len(parts) >= 2:
+                            matching_versions.append(parts[1])
+                            break
+                if matching_versions:
+                    break
+        
+        if not matching_versions:
+            # List available versions for error message
+            available = []
+            for line in result.stdout.split('\n'):
+                if '|' in line and 'kubeadm' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 2:
+                        available.append(parts[1])
+            
+            error_msg = f"Version {target_version} not found in apt repository.\nAvailable versions: {', '.join(available[:10])}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        
+        exact_version = matching_versions[0]
+        logger.info(f"Resolved exact version: {exact_version}")
+        return exact_version
+    
+    def _get_exact_package_version_yum(self, target_version, log_file):
+        """Get the exact package version string from yum repository"""
+        logger.info(f"Resolving exact package version for {target_version}")
+        
+        # Query yum for available versions
+        cmd = self._host_command(['yum', 'list', 'available', 'kubeadm', '--showduplicates'])
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        with open(log_file, 'a') as f:
+            f.write(f"\n=== Available kubeadm versions ===\n")
+            f.write(result.stdout)
+        
+        if result.returncode != 0:
+            raise Exception("Failed to query available package versions")
+        
+        # Parse the output to find matching versions
+        # Format: kubeadm.x86_64    1.31.0-0    kubernetes
+        matching_versions = []
+        for line in result.stdout.split('\n'):
+            if 'kubeadm' in line and target_version in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    version = parts[1]
+                    matching_versions.append(version)
+        
+        if not matching_versions:
+            # Try common version suffixes
+            common_suffixes = ['-0', '-1']
+            for suffix in common_suffixes:
+                test_version = f"{target_version}{suffix}"
+                for line in result.stdout.split('\n'):
+                    if test_version in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            matching_versions.append(parts[1])
+                            break
+                if matching_versions:
+                    break
+        
+        if not matching_versions:
+            # List available versions for error message
+            available = []
+            for line in result.stdout.split('\n'):
+                if 'kubeadm' in line and not line.startswith('Available') and not line.startswith('Installed'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        available.append(parts[1])
+            
+            error_msg = f"Version {target_version} not found in yum repository.\nAvailable versions: {', '.join(available[:10])}"
+            logger.error(error_msg)
+            raise Exception(error_msg)
+        
+        exact_version = matching_versions[0]
+        logger.info(f"Resolved exact version: {exact_version}")
+        return exact_version
+    
     def step_download_packages(self, operation_dir, logs_dir, metadata):
         """Download/prepare upgrade packages"""
         target_version = metadata.get('target_version')
@@ -313,17 +425,23 @@ class UpdateAgent:
         with open(log_file, 'w') as f:
             subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
         
+        # Get the exact package version available in the repository
+        exact_version = self._get_exact_package_version_apt(target_version, log_file)
+        
         # Download packages without installing
-        version_suffix = f"={target_version}-00"
+        version_suffix = f"={exact_version}"
         packages = [
             f"kubeadm{version_suffix}",
             f"kubelet{version_suffix}",
             f"kubectl{version_suffix}"
         ]
         
+        logger.info(f"Downloading packages with version {exact_version}")
+        
         cmd = self._host_command(['apt-get', 'download'] + packages)
         with open(log_file, 'a') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+            f.write(f"\n=== Downloading packages ===\n")
+            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
         logger.info("Packages downloaded successfully")
     
@@ -331,12 +449,17 @@ class UpdateAgent:
         """Download packages using yum (RHEL/CentOS)"""
         logger.info("Using yum package manager")
         
-        version_suffix = f"-{target_version}-0"
+        # Get the exact package version available in the repository
+        exact_version = self._get_exact_package_version_yum(target_version, log_file)
+        
+        version_suffix = f"-{exact_version}"
         packages = [
             f"kubeadm{version_suffix}",
             f"kubelet{version_suffix}",
             f"kubectl{version_suffix}"
         ]
+        
+        logger.info(f"Downloading packages with version {exact_version}")
         
         cmd = self._host_command(['yum', 'install', '--downloadonly', '-y'] + packages)
         with open(log_file, 'w') as f:
@@ -353,14 +476,17 @@ class UpdateAgent:
         
         try:
             if self._check_host_command('apt-get'):
+                exact_version = self._get_exact_package_version_apt(target_version, log_file)
                 cmd = self._host_command(['apt-get', 'install', '-y', '--allow-change-held-packages',
-                       f"kubeadm={target_version}-00"])
+                       f"kubeadm={exact_version}"])
             elif self._check_host_command('yum'):
-                cmd = self._host_command(['yum', 'install', '-y', f"kubeadm-{target_version}-0"])
+                exact_version = self._get_exact_package_version_yum(target_version, log_file)
+                cmd = self._host_command(['yum', 'install', '-y', f"kubeadm-{exact_version}"])
             else:
                 raise Exception("No supported package manager found")
             
-            with open(log_file, 'w') as f:
+            with open(log_file, 'a') as f:
+                f.write(f"\n=== Installing kubeadm {exact_version} ===\n")
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
             # Verify kubeadm version on host
@@ -424,17 +550,20 @@ class UpdateAgent:
         
         try:
             if self._check_host_command('apt-get'):
+                exact_version = self._get_exact_package_version_apt(target_version, log_file)
                 cmd = self._host_command(['apt-get', 'install', '-y', '--allow-change-held-packages',
-                       f"kubelet={target_version}-00",
-                       f"kubectl={target_version}-00"])
+                       f"kubelet={exact_version}",
+                       f"kubectl={exact_version}"])
             elif self._check_host_command('yum'):
+                exact_version = self._get_exact_package_version_yum(target_version, log_file)
                 cmd = self._host_command(['yum', 'install', '-y',
-                       f"kubelet-{target_version}-0",
-                       f"kubectl-{target_version}-0"])
+                       f"kubelet-{exact_version}",
+                       f"kubectl-{exact_version}"])
             else:
                 raise Exception("No supported package manager found")
             
-            with open(log_file, 'w') as f:
+            with open(log_file, 'a') as f:
+                f.write(f"\n=== Installing kubelet and kubectl {exact_version} ===\n")
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
             
             # Verify versions on host
